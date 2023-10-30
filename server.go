@@ -16,6 +16,7 @@ import (
 )
 
 var (
+	localDomain = "local"
 	// Multicast groups used by mDNS
 	mdnsGroupIPv4 = net.IPv4(224, 0, 0, 251)
 	mdnsGroupIPv6 = net.ParseIP("ff02::fb")
@@ -42,8 +43,8 @@ var (
 )
 
 // Register a service by given arguments. This call will take the system's hostname
-// and lookup IP by that hostname.
-func Register(instance, service, domain string, port int, text []string, iface *net.Interface) (*Server, error) {
+// and lookup IP by that hostname. If ttl is 0 the default will be user
+func Register(instance, service, domain string, port int, text []string, iface *net.Interface, ttl uint32) (*Server, error) {
 	entry := NewServiceEntry(instance, service, domain)
 	entry.Port = port
 	entry.Text = text
@@ -55,7 +56,7 @@ func Register(instance, service, domain string, port int, text []string, iface *
 		return nil, fmt.Errorf("Missing service name")
 	}
 	if entry.Domain == "" {
-		entry.Domain = "local"
+		entry.Domain = localDomain
 	}
 	if entry.Port == 0 {
 		return nil, fmt.Errorf("Missing port")
@@ -70,22 +71,23 @@ func Register(instance, service, domain string, port int, text []string, iface *
 	}
 	entry.HostName = fmt.Sprintf("%s.", trimDot(entry.HostName))
 
-	addrs, err := net.LookupIP(entry.HostName)
+	iaddrs, err := net.InterfaceAddrs()
 	if err != nil {
-		// Try appending the host domain suffix and lookup again
-		// (required for Linux-based hosts)
-		tmpHostName := fmt.Sprintf("%s%s.", entry.HostName, entry.Domain)
-		addrs, err = net.LookupIP(tmpHostName)
-		if err != nil {
-			return nil, fmt.Errorf("Could not determine host IP addresses for %s", entry.HostName)
+		return nil, err
+	}
+
+	for _, address := range iaddrs {
+		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && !ipnet.IP.IsLinkLocalUnicast() {
+			if ipnet.IP.To4() != nil {
+				entry.AddrIPv4 = append(entry.AddrIPv4, ipnet.IP)
+			} else if ipnet.IP.To16() != nil {
+				entry.AddrIPv6 = append(entry.AddrIPv6, ipnet.IP)
+			}
 		}
 	}
-	for i := 0; i < len(addrs); i++ {
-		if ipv4 := addrs[i].To4(); ipv4 != nil {
-			entry.AddrIPv4 = addrs[i]
-		} else if ipv6 := addrs[i].To16(); ipv6 != nil {
-			entry.AddrIPv6 = addrs[i]
-		}
+
+	if entry.AddrIPv6 == nil && entry.AddrIPv4 == nil {
+		return nil, fmt.Errorf("could not determine host IP addresses")
 	}
 
 	s, err := newServer(iface)
@@ -93,6 +95,9 @@ func Register(instance, service, domain string, port int, text []string, iface *
 		return nil, err
 	}
 
+	if ttl != 0 {
+		s.ttl = ttl
+	}
 	s.service = entry
 	go s.mainloop()
 	go s.probe()
@@ -102,7 +107,7 @@ func Register(instance, service, domain string, port int, text []string, iface *
 
 // Register a service proxy by given argument. This call will skip the hostname/IP lookup and
 // will use the provided values.
-func RegisterProxy(instance, service, domain string, port int, host, ip string, text []string, iface *net.Interface) (*Server, error) {
+func RegisterProxy(instance, service, domain string, port int, host string, ipv4, ipv6 []net.IP, text []string, iface *net.Interface) (*Server, error) {
 	entry := NewServiceEntry(instance, service, domain)
 	entry.Port = port
 	entry.Text = text
@@ -118,7 +123,7 @@ func RegisterProxy(instance, service, domain string, port int, host, ip string, 
 		return nil, fmt.Errorf("Missing host name")
 	}
 	if entry.Domain == "" {
-		entry.Domain = "local"
+		entry.Domain = localDomain
 	}
 	if entry.Port == 0 {
 		return nil, fmt.Errorf("Missing port")
@@ -128,15 +133,10 @@ func RegisterProxy(instance, service, domain string, port int, host, ip string, 
 		entry.HostName = fmt.Sprintf("%s.%s.", trimDot(entry.HostName), trimDot(entry.Domain))
 	}
 
-	ipAddr := net.ParseIP(ip)
-	if ipAddr == nil {
-		return nil, fmt.Errorf("Failed to parse given IP: %v", ip)
-	} else if ipv4 := ipAddr.To4(); ipv4 != nil {
-		entry.AddrIPv4 = ipAddr
-	} else if ipv6 := ipAddr.To16(); ipv6 != nil {
-		entry.AddrIPv4 = ipAddr
-	} else {
-		return nil, fmt.Errorf("The IP is neither IPv4 nor IPv6: %#v", ipAddr)
+	entry.AddrIPv4 = append(entry.AddrIPv4, ipv4...)
+	entry.AddrIPv6 = append(entry.AddrIPv6, ipv6...)
+	if entry.AddrIPv4 == nil && entry.AddrIPv6 == nil {
+		return nil, fmt.Errorf("A valid IPv4 and/or IPv6 address must be supplied")
 	}
 
 	s, err := newServer(iface)
@@ -151,14 +151,14 @@ func RegisterProxy(instance, service, domain string, port int, host, ip string, 
 	return s, nil
 }
 
-// Server structure incapsulates both IPv4/IPv6 UDP connections
+// Server structure encapsulates both IPv4/IPv6 UDP connections
 type Server struct {
-	service        *ServiceEntry
-	ipv4conn       *net.UDPConn
-	ipv6conn       *net.UDPConn
-	shouldShutdown bool
-	shutdownLock   sync.Mutex
-	ttl            uint32
+	service      *ServiceEntry
+	ipv4conn     *net.UDPConn
+	ipv6conn     *net.UDPConn
+	shuttingDown bool
+	shutdownLock sync.Mutex
+	ttl          uint32
 }
 
 // Constructs server structure
@@ -179,19 +179,28 @@ func newServer(iface *net.Interface) (*Server, error) {
 	// Join multicast groups to receive announcements
 	p1 := ipv4.NewPacketConn(ipv4conn)
 	p2 := ipv6.NewPacketConn(ipv6conn)
+	errCount1, errCount2 := 0, 0
 	if iface != nil {
 		if err := p1.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
-			return nil, err
+			errCount1++
+		}
+		if err := p1.SetMulticastInterface(iface); err != nil {
+			errCount1++
 		}
 		if err := p2.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
-			return nil, err
+			errCount2++
+		}
+		if err := p2.SetMulticastInterface(iface); err != nil {
+			errCount2++
+		}
+		if errCount1 > 0 && errCount2 > 0 {
+			return nil, fmt.Errorf("Failed to join a multicast group on interface")
 		}
 	} else {
 		ifaces, err := net.Interfaces()
 		if err != nil {
 			return nil, err
 		}
-		errCount1, errCount2 := 0, 0
 		for _, iface := range ifaces {
 			if err := p1.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
 				errCount1++
@@ -247,10 +256,12 @@ func (s *Server) shutdown() error {
 
 	s.unregister()
 
-	if s.shouldShutdown {
+	if s.shuttingDown {
 		return nil
 	}
-	s.shouldShutdown = true
+	s.shuttingDown = true
+
+	s.unregister()
 
 	if s.ipv4conn != nil {
 		s.ipv4conn.Close()
@@ -267,7 +278,7 @@ func (s *Server) recv(c *net.UDPConn) {
 		return
 	}
 	buf := make([]byte, 65536)
-	for !s.shouldShutdown {
+	for !s.shuttingDown {
 		n, from, err := c.ReadFrom(buf)
 		if err != nil {
 			continue
@@ -346,6 +357,8 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg) error {
 		s.composeBrowsingAnswers(resp, s.ttl)
 	case s.service.ServiceInstanceName():
 		s.composeLookupAnswers(resp, s.ttl)
+	case s.service.HostName:
+		s.composeLookupAnswers(resp, s.ttl)
 	case s.service.ServiceTypeName():
 		s.serviceTypeName(resp, s.ttl)
 	}
@@ -388,7 +401,7 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ttl uint32) {
 	}
 	resp.Extra = append(resp.Extra, srv, txt)
 
-	if s.service.AddrIPv4 != nil {
+	for _, ipv4 := range s.service.AddrIPv4 {
 		a := &dns.A{
 			Hdr: dns.RR_Header{
 				Name:   s.service.HostName,
@@ -396,11 +409,11 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ttl uint32) {
 				Class:  dns.ClassINET,
 				Ttl:    ttl,
 			},
-			A: s.service.AddrIPv4,
+			A: ipv4,
 		}
 		resp.Extra = append(resp.Extra, a)
 	}
-	if s.service.AddrIPv6 != nil {
+	for _, ipv6 := range s.service.AddrIPv6 {
 		aaaa := &dns.AAAA{
 			Hdr: dns.RR_Header{
 				Name:   s.service.HostName,
@@ -408,7 +421,7 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ttl uint32) {
 				Class:  dns.ClassINET,
 				Ttl:    ttl,
 			},
-			AAAA: s.service.AddrIPv6,
+			AAAA: ipv6,
 		}
 		resp.Extra = append(resp.Extra, aaaa)
 	}
@@ -462,7 +475,7 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32) {
 	}
 	resp.Answer = append(resp.Answer, srv, txt, ptr, dnssd)
 
-	if s.service.AddrIPv4 != nil {
+	for _, ipv4 := range s.service.AddrIPv4 {
 		a := &dns.A{
 			Hdr: dns.RR_Header{
 				Name:   s.service.HostName,
@@ -470,11 +483,11 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32) {
 				Class:  dns.ClassINET | cache_flush,
 				Ttl:    120,
 			},
-			A: s.service.AddrIPv4,
+			A: ipv4,
 		}
 		resp.Extra = append(resp.Extra, a)
 	}
-	if s.service.AddrIPv6 != nil {
+	for _, ipv6 := range s.service.AddrIPv6 {
 		aaaa := &dns.AAAA{
 			Hdr: dns.RR_Header{
 				Name:   s.service.HostName,
@@ -482,7 +495,7 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32) {
 				Class:  dns.ClassINET | cache_flush,
 				Ttl:    120,
 			},
-			AAAA: s.service.AddrIPv6,
+			AAAA: ipv6,
 		}
 		resp.Extra = append(resp.Extra, aaaa)
 	}
@@ -510,7 +523,7 @@ func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
 }
 
 // Perform probing & announcement
-//TODO: implement a proper probing & conflict resolution
+// TODO: implement a proper probing & conflict resolution
 func (s *Server) probe() {
 	q := new(dns.Msg)
 	q.SetQuestion(s.service.ServiceInstanceName(), dns.TypePTR)
