@@ -203,13 +203,13 @@ func (c *client) mainloop(params *LookupParams) {
 				case *dns.A:
 					for _, e := range entries {
 						if e.HostName == rr.Hdr.Name{
-							e.AddrIPv4 = append(e.AddrIPv4, rr.A)
+							c.addIpIfUnknown(e.AddrIPv4, rr.A)
 						}
 					}
 				case *dns.AAAA:
 					for _, e := range entries {
 						if e.HostName == rr.Hdr.Name {
-							e.AddrIPv6 = append(e.AddrIPv6, rr.AAAA)
+							c.addIpIfUnknown(e.AddrIPv6, rr.AAAA)
 						}
 					}
 				}
@@ -232,6 +232,19 @@ func (c *client) mainloop(params *LookupParams) {
 			// reset entries
 			entries = make(map[string]*ServiceEntry)
 		}
+	}
+}
+
+func (c *client) addIpIfUnknown(target []net.IP, ip net.IP){
+	skip := false
+	for _, known := range target {
+		if known.Equal(ip) {
+			skip = true
+			break
+		}
+	}
+	if !skip {
+		target = append(target, ip)
 	}
 }
 
